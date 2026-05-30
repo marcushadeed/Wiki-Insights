@@ -1,0 +1,14 @@
+.venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.mypy_cache/
+
+# Generated index data and Wikipedia ZIM archives
+data/
+wikipedia_dump/
+
+# Local environment
+.env
+.env.*
