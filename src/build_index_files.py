@@ -10,13 +10,36 @@ TITLE_FILE = Path(__file__).resolve().parent.parent / "data/wiki_titles.txt"
 INDEX_FILE = Path(__file__).resolve().parent.parent / "data/titles_index.idx"
 REFERENCE_FILE = Path(__file__).resolve().parent.parent / "data/references.idx"
 
-def create_title_list() -> bool:
-    print("Creating title list...")
+BAR_FORMAT = "{bar:10} | {n_fmt}/{total_fmt} | {percentage:3.1f}% {postfix}"
 
-    # Get the titles from the zim file
-    print("Retrieving titles from zim file...")
+
+def step_tqdm(iterable, *, step: int, total_steps: int, desc: str, unit: str, **kwargs):
+    return tqdm(
+        iterable,
+        ncols=100,
+        unit=unit,
+        bar_format=BAR_FORMAT,
+        desc=desc,
+        postfix=f"{step}/{total_steps}",
+        leave=False,
+        **kwargs,
+    )
+
+
+def title_line_count() -> int:
+    with TITLE_FILE.open("rb") as f:
+        return sum(1 for _ in f)
+
+
+def create_title_list() -> bool:
     titles = []
-    for i in tqdm(range(WIKI_ARCHIVE.all_entry_count), ncols=100, unit=" entries", bar_format="{bar:10} | {n_fmt}/{total_fmt} | {percentage:3.1f}%", desc="Processing entries"):
+    for i in step_tqdm(
+        range(WIKI_ARCHIVE.all_entry_count),
+        step=1,
+        total_steps=2,
+        desc="Reading ZIM entries",
+        unit="entries",
+    ):
         entry = WIKI_ARCHIVE._get_entry_by_id(i)
 
         if entry.is_redirect:
@@ -27,39 +50,34 @@ def create_title_list() -> bool:
 
         if entry.title is not None:
             titles.append(entry.title)
-    
-    # Sort the titles
-    print("Sorting titles...")
+
     titles.sort()
 
-    # Write the titles to a file
-    print("Writing titles to file...")
     with open(TITLE_FILE, "w") as f:
-        for title in titles:
+        for title in step_tqdm(
+            titles,
+            step=2,
+            total_steps=2,
+            desc="Writing titles",
+            unit="titles",
+        ):
             f.write(title + "\n")
 
-    print("Title list created successfully")
     return True
 
+
 def index_titles() -> bool:
-    print("Indexing titles...")
-
-    # Get title count
-    title_count = sum(1 for _ in TITLE_FILE.open("rb"))
-
-    # Build the index
     try:
+        title_count = title_line_count()
         with TITLE_FILE.open("rb") as f, INDEX_FILE.open("wb") as idx:
             offset = 0
-            progress_bar = tqdm(
+            for _ in step_tqdm(
                 range(title_count),
-                ncols=100,
-                unit=" titles",
-                bar_format="{bar:10} | {n_fmt}/{total_fmt} | {percentage:3.1f}%",
-                desc="Indexing titles"
-            )
-            
-            for _ in progress_bar:
+                step=1,
+                total_steps=1,
+                desc="Indexing titles",
+                unit="titles",
+            ):
                 idx.write(struct.pack("<q", offset))
                 line = f.readline()
                 if not line:
@@ -68,22 +86,27 @@ def index_titles() -> bool:
     except OSError as e:
         print(f"Could not build index file: {e}")
         return False
-    
-    print("Titles indexed successfully")
+
     return True
 
+
 def remove_old_data() -> bool:
-    print("Removing old data...")
     try:
-        for file in [TITLE_FILE, INDEX_FILE]:
+        for file in step_tqdm(
+            [TITLE_FILE, INDEX_FILE],
+            step=1,
+            total_steps=1,
+            desc="Removing files",
+            unit="files",
+        ):
             if file.exists():
                 file.unlink()
     except OSError as e:
         print(f"Could not remove old data: {e}")
         return False
 
-    print("Old data removed successfully")
     return True
+
 
 def get_index(title: str) -> int | None:
     target = title.encode("utf-8")
@@ -118,10 +141,11 @@ def get_index(title: str) -> int | None:
 
     return None
 
+
 def get_title(index: int) -> str | None:
     if index is None:
         return None
-    
+
     try:
         with INDEX_FILE.open("rb") as idx, TITLE_FILE.open("rb") as f:
             idx.seek(index * 8)
@@ -138,11 +162,13 @@ def get_title(index: int) -> str | None:
         print(f"get_title: corrupt data: {e}")
         return None
 
+
 def path_from_title(title: str) -> str:
     slug = title.replace(' ', '_')
     # Wikipedia keeps these chars unencoded in article paths
     encoded = quote(slug, safe="(),-._~!*':@")
     return f"A/{encoded}"
+
 
 def get_reference_indices(index: int) -> list[int]:
     if index is None:
@@ -165,55 +191,57 @@ def get_reference_indices(index: int) -> list[int]:
                 references.add(ref_index)
     return list(references)
 
+
 def build_reference_map() -> bool:
-    print("Building reference map...")
-
-    # Get title count
-    title_count = sum(1 for _ in TITLE_FILE.open("rb"))
-
     try:
+        title_count = title_line_count()
         with TITLE_FILE.open("rb") as f, REFERENCE_FILE.open("wb") as idx:
-            offset = 0
-            progress_bar = tqdm(
+            for _ in step_tqdm(
                 range(title_count),
-                ncols=100,
-                unit=" titles",
-                bar_format="{bar:10} | {n_fmt}/{total_fmt} | {percentage:3.1f}%",
-                desc="Building reference map"
-            )
-
-            for _ in progress_bar:
-                _ = 1
-                # mph TODO: Build the reference map
-                
+                step=1,
+                total_steps=1,
+                desc="Building reference map",
+                unit="titles",
+            ):
+                line = f.readline()
+                if not line:
+                    break
+                # TODO: Build the reference map
     except OSError as e:
         print(f"Could not build reference map: {e}")
         return False
 
-    print("Reference map built successfully")
     return True
+
 
 def index_all_data(force: bool = False) -> bool:
     if not force:
         confirm = input("Are you sure you want to re-index all data? (y/n): ")
         if not confirm or confirm[0].lower() != "y":
             return False
-    
-    if not remove_old_data():
-        return False
 
-    if not create_title_list():
-        return False
+    steps = [
+        ("remove_old_data", remove_old_data),
+        ("create_title_list", create_title_list),
+        ("index_titles", index_titles),
+        ("build_reference_map", build_reference_map),
+    ]
 
-    if not index_titles():
-        return False
+    with tqdm(
+        total=len(steps),
+        desc="Pipeline",
+        unit="fn",
+        ncols=100,
+        bar_format="{n_fmt}/{total_fmt} total steps completed",
+    ) as pipeline:
+        for name, fn in steps:
+            pipeline.set_postfix_str(name)
+            if not fn():
+                return False
+            pipeline.update(1)
 
-    if not build_reference_map():
-        return False
-
-    print("All data indexed successfully!")
     return True
 
+
 if __name__ == "__main__":
-    index_all_data(force=True)
-    # print(get_reference_indices(500000))
+    index_all_data(force=False)
