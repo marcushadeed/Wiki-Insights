@@ -47,6 +47,8 @@ def create_title_list() -> bool:
         item = entry.get_item()
         if "text/html" not in item.mimetype:
             continue
+        if is_html_redirect(item):
+            continue
 
         if entry.title is not None:
             titles.append(entry.title)
@@ -163,6 +165,21 @@ def get_title(index: int) -> str | None:
         return None
 
 
+# Redirects to anchored sections (e.g. "#Discography") can't be expressed as
+# native ZIM redirects, so they're stored as tiny HTML pages with a
+# <meta http-equiv="refresh"> tag.  The size gap between these pages
+# (≤514 B, empirically) and the smallest real article (≥4109 B) lets us
+# use a cheap size pre-filter to skip the content fetch for real articles.
+_HTML_REDIRECT_MAX_SIZE = 2048
+_HTML_REDIRECT_PATTERN = b"http-equiv"
+
+
+def is_html_redirect(item) -> bool:
+    if item.size > _HTML_REDIRECT_MAX_SIZE:
+        return False
+    return _HTML_REDIRECT_PATTERN in bytes(item.content[:512])
+
+
 def path_from_title(title: str) -> str:
     slug = title.replace(' ', '_')
     # Wikipedia keeps these chars unencoded in article paths
@@ -174,21 +191,21 @@ def get_reference_indices(index: int) -> list[int]:
     if index is None:
         return []
 
-    entry = WIKI_ARCHIVE.get_entry_by_path(path_from_title(get_title(index)))
+    entry = WIKI_ARCHIVE.get_entry_by_title(get_title(index))
     content = bytes(entry.get_item().content).decode("utf-8")
-    lines = content.splitlines()
     references = set()
-    for line in lines:
-        if "<a href=" in line:
-            href = line.split("<a href=\"")[1].split("\"")[0]
-            raw = href.split("?", 1)[0].split("#", 1)[0]
-            if raw.startswith("./"):
-                raw = raw[2:]
-            if not raw:
-                continue
-            ref_index = get_index(raw)
-            if ref_index is not None:
-                references.add(ref_index)
+    rest = content
+    while '<a href="' in rest:
+        _, after = rest.split('<a href="', 1)
+        href, rest = after.split('"', 1)
+        raw = href.split("?", 1)[0].split("#", 1)[0]
+        if raw.startswith("./"):
+            raw = raw[2:]
+        if not raw:
+            continue
+        ref_index = get_index(raw)
+        if ref_index is not None:
+            references.add(ref_index)
     return list(references)
 
 
@@ -241,7 +258,3 @@ def index_all_data(force: bool = False) -> bool:
             pipeline.update(1)
 
     return True
-
-
-if __name__ == "__main__":
-    index_all_data(force=False)
