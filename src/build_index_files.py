@@ -1,10 +1,17 @@
 from libzim.reader import Archive
 from pathlib import Path
 from tqdm import tqdm
+from multiprocessing import Pool
+import os
+import re
 import struct
-from urllib.parse import quote
+from urllib.parse import quote, unquote
 
-WIKI_ARCHIVE = Archive("wikipedia_dump/wikipedia_en_all_nopic_2026-03.zim")
+ZIM_PATH = "wikipedia_dump/wikipedia_en_all_nopic_2026-03.zim"
+WIKI_ARCHIVE = Archive(ZIM_PATH)
+
+N_WORKERS = min(8, os.cpu_count() or 4)
+CHUNK_SIZE = 1000
 
 TITLE_FILE = Path(__file__).resolve().parent.parent / "data/wiki_titles.txt"
 INDEX_FILE = Path(__file__).resolve().parent.parent / "data/titles_index.idx"
@@ -187,43 +194,123 @@ def path_from_title(title: str) -> str:
     return f"A/{encoded}"
 
 
+def title_from_path(path: str) -> str:
+    # Inverse of path_from_title: undo URL-encoding and the space->underscore
+    # substitution so an href slug can be matched against the stored title.
+    return unquote(path).replace("_", " ")
+
+
+_HREF_PATTERN = re.compile(rb'<a href="([^"]*)"')
+
+
+def _parse_reference_paths(content) -> set[str]:
+    # Accepts bytes (hot path, skips a full-page decode) or str (legacy caller).
+    raw = content if isinstance(content, bytes) else content.encode("utf-8")
+    paths = set()
+    for m in _HREF_PATTERN.finditer(raw):
+        href = m.group(1).split(b"?", 1)[0].split(b"#", 1)[0]
+        if href.startswith(b"./"):
+            href = href[2:]
+        if href:
+            paths.add(title_from_path(href.decode("utf-8")))
+    return paths
+
+
 def get_reference_indices(index: int) -> list[int]:
     if index is None:
         return []
 
     entry = WIKI_ARCHIVE.get_entry_by_title(get_title(index))
-    content = bytes(entry.get_item().content).decode("utf-8")
-    references = set()
-    rest = content
-    while '<a href="' in rest:
-        _, after = rest.split('<a href="', 1)
-        href, rest = after.split('"', 1)
-        raw = href.split("?", 1)[0].split("#", 1)[0]
-        if raw.startswith("./"):
-            raw = raw[2:]
-        if not raw:
-            continue
-        ref_index = get_index(raw)
-        if ref_index is not None:
-            references.add(ref_index)
+    content = bytes(entry.get_item().content)
+    references = {
+        ref_index
+        for title in _parse_reference_paths(content)
+        if (ref_index := get_index(title)) is not None
+    }
     return list(references)
 
 
-def build_reference_map() -> bool:
+def _load_title_index_map() -> dict[str, int]:
+    # Load to memory to avoid binary search over the on-disk index.
+    title_to_index = {}
+    with TITLE_FILE.open("rb") as f:
+        for i, line in enumerate(f):
+            title_to_index[line.rstrip(b"\n").decode("utf-8")] = i
+    return title_to_index
+
+
+# Set by the parent before the worker Pool is forked so each worker inherits
+# the (large) title->index map via copy-on-write instead of pickling it.
+_PARENT_MAP: dict[str, int] | None = None
+_WORKER_ARCHIVE = None
+_WORKER_MAP: dict[str, int] | None = None
+
+
+def _worker_init() -> None:
+    global _WORKER_ARCHIVE, _WORKER_MAP
+    _WORKER_ARCHIVE = Archive(ZIM_PATH)
+    _WORKER_MAP = _PARENT_MAP
+
+
+def _refs_for(archive, title: str, title_to_index: dict[str, int]) -> set[int]:
+    raw = bytes(archive.get_entry_by_title(title).get_item().content)
+    return {
+        idx
+        for p in _parse_reference_paths(raw)
+        if (idx := title_to_index.get(p)) is not None
+    }
+
+
+def _pack_record(source: int, refs: set[int]) -> bytes:
+    return struct.pack(f"<{len(refs) + 2}I", source, len(refs), *refs)
+
+
+def _process_chunk(args: tuple[int, list[str]]) -> bytes:
+    start_i, titles = args
+    out = bytearray()
+    for offset, title in enumerate(titles):
+        refs = _refs_for(_WORKER_ARCHIVE, title, _WORKER_MAP)
+        out += _pack_record(start_i + offset, refs)
+    return bytes(out)
+
+
+def build_reference_map(limit: int | None = None, workers: int = N_WORKERS) -> bool:
+    global _PARENT_MAP
     try:
-        title_count = title_line_count()
-        with TITLE_FILE.open("rb") as f, REFERENCE_FILE.open("wb") as idx:
-            for _ in step_tqdm(
-                range(title_count),
+        title_to_index = _load_title_index_map()
+        n = len(title_to_index) if limit is None else min(limit, len(title_to_index))
+
+        with TITLE_FILE.open("rb") as f:
+            titles = [f.readline().rstrip(b"\n").decode("utf-8") for _ in range(n)]
+        chunks = [
+            (start, titles[start:start + CHUNK_SIZE])
+            for start in range(0, n, CHUNK_SIZE)
+        ]
+
+        _PARENT_MAP = title_to_index
+        with REFERENCE_FILE.open("wb") as idx:
+            bar = step_tqdm(
+                range(n),
                 step=1,
                 total_steps=1,
                 desc="Building reference map",
                 unit="titles",
-            ):
-                line = f.readline()
-                if not line:
-                    break
-                # TODO: Build the reference map
+            )
+            with bar:
+                if workers <= 1:
+                    # In-process path (testable, no fork): use the module archive.
+                    for start, chunk_titles in chunks:
+                        for offset, title in enumerate(chunk_titles):
+                            refs = _refs_for(WIKI_ARCHIVE, title, title_to_index)
+                            idx.write(_pack_record(start + offset, refs))
+                            bar.update(1)
+                else:
+                    with Pool(workers, initializer=_worker_init) as pool:
+                        for (_, chunk_titles), packed in zip(
+                            chunks, pool.imap(_process_chunk, chunks)
+                        ):
+                            idx.write(packed)
+                            bar.update(len(chunk_titles))
     except OSError as e:
         print(f"Could not build reference map: {e}")
         return False
@@ -258,3 +345,7 @@ def index_all_data(force: bool = False) -> bool:
             pipeline.update(1)
 
     return True
+
+
+if __name__ == "__main__":
+    build_reference_map()

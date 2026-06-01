@@ -1,3 +1,2 @@
-anyascii>=0.3.3
-mwtp>=4.0.0
+libzim>=3.9.0
 tqdm>=4.66.0
